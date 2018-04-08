@@ -198,17 +198,19 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
 
         switch (currentState) {
-        case SKIP_CONTROL_CHARS: {
-            if (!skipControlCharacters(buffer)) {
+        case SKIP_CONTROL_CHARS: { // currentState 默认是 SKIP_CONTROL_CHARS, 从这里开始
+            if (!skipControlCharacters(buffer)) {   // 如果请求开始有空格之类的则先去掉.
                 return;
             }
             currentState = State.READ_INITIAL;
         }
         case READ_INITIAL: try {
+        	// 从buffer中读取一行, 一般是读取到 GET / HTTP/1.1
             AppendableCharSequence line = lineParser.parse(buffer);
             if (line == null) {
                 return;
             }
+            // 将 GET / HTTP/1.1 转化为 GET, /, HTTP/1.1 数组
             String[] initialLine = splitInitialLine(line);
             if (initialLine.length < 3) {
                 // Invalid initial line - ignore.
@@ -216,6 +218,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                 return;
             }
 
+            // 创建HttpMessage, 此时HttpMessage 中已经有了请求方法, 请求路径和 http版本
             message = createMessage(initialLine);
             currentState = State.READ_HEADER;
             // fall-through
@@ -319,12 +322,16 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
          * read chunk, read and ignore the CRLF and repeat until 0
          */
         case READ_CHUNK_SIZE: try {
+            // 读取一行
             AppendableCharSequence line = lineParser.parse(buffer);
             if (line == null) {
                 return;
             }
             int chunkSize = getChunkSize(line.toString());
             this.chunkSize = chunkSize;
+            /**
+             * 如果chunk 可用的话, 则继续处理READ_CHUNKED_CONTENT, 否则处理READ_CHUNK_FOOTER
+             */
             if (chunkSize == 0) {
                 currentState = State.READ_CHUNK_FOOTER;
                 return;
@@ -576,7 +583,12 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         return skiped;
     }
 
-    private State readHeaders(ByteBuf buffer) {
+	/**
+	 * 将ByteBuf 按照\r\n 进行分割成行, 然后处理每一行按照: 切割成header设置到headers里
+	 * @param buffer
+	 * @return
+	 */
+	private State readHeaders(ByteBuf buffer) {
         final HttpMessage message = this.message;
         final HttpHeaders headers = message.headers();
 
@@ -585,7 +597,8 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             return null;
         }
         if (line.length() > 0) {
-            do {
+	        // 将所有的header都读取出来, 然后根据: 切割
+	        do {
                 char firstChar = line.charAt(0);
                 if (name != null && (firstChar == ' ' || firstChar == '\t')) {
                     //please do not make one line from below code
@@ -607,10 +620,11 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             } while (line.length() > 0);
         }
 
-        // Add the last header.
+        // 因为上面的是按照do-while处理的, 最后一个header可能没有插入进去, 因此这里进行处理一下
         if (name != null) {
             headers.add(name, value);
         }
+
         // reset name and value fields
         name = null;
         value = null;
@@ -760,7 +774,24 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
     }
 
-    private static int findNonWhitespace(AppendableCharSequence sb, int offset) {
+	/**
+	 * 从offset开始遍历AppendableCharSequence, 直到找到第一个非空格的位置
+	 *
+	 * It is Unicode space character (SPACE_SEPARATOR, LINE_SEPARATOR, or PARAGRAPH_SEPARATOR) but is not also a non-breaking space ('\u00A0', '\u2007', '\u202F')
+	 * It is '\t', U+0009 HORIZONTAL TABULATION.
+	 * It is '\n', U+000A LINE FEED.
+	 * It is '\u000B', U+000B VERTICAL TABULATION.
+	 * It is '\f', U+000C FORM FEED.
+	 * It is '\r', U+000D CARRIAGE RETURN.
+	 * It is '\u001C', U+001C FILE SEPARATOR.
+	 * It is '\u001D', U+001D GROUP SEPARATOR.
+	 * It is '\u001E', U+001E RECORD SEPARATOR.
+	 * It is '\u001F', U+001F UNIT SEPARATOR.
+	 * @param sb
+	 * @param offset
+	 * @return
+	 */
+	private static int findNonWhitespace(AppendableCharSequence sb, int offset) {
         for (int result = offset; result < sb.length(); ++result) {
             if (!Character.isWhitespace(sb.charAtUnsafe(result))) {
                 return result;
@@ -797,14 +828,22 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             this.maxLength = maxLength;
         }
 
+	    /**
+	     * 每次parse出来的都是一行的数据, 因为http请求是按照行来处理的
+	     *
+	     * @param buffer
+	     * @return
+	     */
         public AppendableCharSequence parse(ByteBuf buffer) {
             final int oldSize = size;
             seq.reset();
+            // buffer.forEachByte(this); 会调用 process(byte value) 方法, 在process方法里定义seq边界, 将边界内的byte插入seq里
             int i = buffer.forEachByte(this);
             if (i == -1) {
                 size = oldSize;
                 return null;
             }
+            // 标记readerIndex 方便下一次读
             buffer.readerIndex(i + 1);
             return seq;
         }
@@ -813,13 +852,22 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             size = 0;
         }
 
+	    /**
+	     * 判断byte是否终止符, 如果不是则添加到seq里 返回true表示继续处理, 如果是终止符, 则返回false, 表示当前行处理完了
+	     *
+	     * @param value
+	     * @return
+	     * @throws Exception
+	     */
         @Override
         public boolean process(byte value) throws Exception {
+            //
             char nextByte = (char) (value & 0xFF);
-            if (nextByte == HttpConstants.CR) {
+            // 目前http是\r\n 来表示换行, 所以如果遇到\r则表示返回true, 继续处理. 由此可见, 在http消息中是可以包含\r的
+            if (nextByte == HttpConstants.CR) {     // 13	0D	CR (carriage return)	回车键 \r
                 return true;
             }
-            if (nextByte == HttpConstants.LF) {
+            if (nextByte == HttpConstants.LF) {     // 10	0A	LF (NL line feed, new line)	换行键 \n
                 return false;
             }
 
